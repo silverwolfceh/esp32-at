@@ -29,11 +29,14 @@
 #include "freertos/task.h"
 #include "string.h"
 #include "esp_at.h"
+#include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-
+#include "aws_tls.h"
+#include "certificates.h"
 #include "esp_system.h"
 #include "at_upgrade.h"
+#define LOG_TAG "AWS_TLS"
 
 #include "driver/uart.h"
 
@@ -48,6 +51,16 @@ typedef struct {
     int8_t parity;
     int8_t flow_control;
 } at_nvm_uart_config_struct; 
+
+#define MAX_SSL_CLIENT   1
+sslclient_context ssl_clients[MAX_SSL_CLIENT] = {0};
+
+#define OK_RESP "OK"
+#define START_READ "\r\n>"
+#define SEND_OK  "\r\nSEND"
+#define START_WRITE "\r\n+IPD"
+volatile bool tls_communicate_wait_uart_data = false;
+
 
 QueueHandle_t esp_at_uart_queue = NULL;
 static bool at_default_flag = false;
@@ -128,6 +141,10 @@ static void uart_task(void *pvParameters)
             switch (event.type) {
             //Event of UART receving data
             case UART_DATA:
+                if(tls_communicate_wait_uart_data)
+                {
+                    break;
+                }
                 if (event.size) {
                     esp_at_port_recv_data_notify (event.size, portMAX_DELAY);
                 }
@@ -144,6 +161,69 @@ static void uart_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+
+static void tls_communicate_task(void *pvParameters)
+{
+    sslclient_context *ssl_client;
+    int i = 0;
+    for (;;) {
+        for(i = 0; i < MAX_SSL_CLIENT; i++)
+        {
+            ssl_client = (sslclient_context  *)&(ssl_clients[i]);
+            if(ssl_client->init && ssl_client->socket != 0)
+            {
+                int data_ready = aws_tls_data_ready(ssl_client);
+                if(data_ready > 0)
+                {
+                    printf("Data ready: %d\r\n", data_ready);
+                    uint8_t *buf = malloc(data_ready);
+                    int received = 0;
+                    while(received < data_ready)
+                    {
+                        received += aws_tls_receive(ssl_client, buf + received, data_ready);
+                        vTaskDelay(10);
+                    }
+                    printf("Data received: %d\r\n", data_ready);
+                    if(at_port_wait_write_complete(500))
+                    {
+
+                        uint8_t *ipd_cmd = (uint8_t *)malloc(50);
+                        
+                        sprintf((char *)ipd_cmd, "\r\n+IPD,%d,%d:", i, data_ready);
+                        printf("Write IPD: %s \r\n", ipd_cmd);
+                        at_port_write_data(ipd_cmd, strlen((char *)ipd_cmd));
+
+                        if(at_port_wait_write_complete(500))
+                        {
+                            printf("Write IPD payload: %d bytes \r\n", data_ready);
+                            at_port_write_data(buf, data_ready);
+                            if(at_port_wait_write_complete(500))
+                            {
+                                printf("Write IPD payload done \r\n");
+                            }
+                            else
+                            {
+                                printf("Write IPD payload timeout \n");
+                            }
+                        }
+                        else
+                        {
+                            printf("Write IPD time out \r\n");
+                        }
+                        free(ipd_cmd);
+                    }
+                    else
+                    {
+                        printf("Another write in progess. \r\n");
+                    }
+                    free(buf);
+                }
+            }
+        }
+        vTaskDelay(10);
+    }
+    vTaskDelete(NULL);
+}
 
 static void at_uart_init(void)
 {
@@ -459,11 +539,150 @@ static uint8_t at_setupCmdCipupdate(uint8_t para_num)
     return ESP_AT_RESULT_CODE_ERROR;
 }
 
+
+static uint8_t at_setupTLSConnection(uint8_t para_num)
+{
+    printf("%s %d \r\n", __FUNCTION__, para_num);
+    uint8_t cnt = 0;
+    int32_t socket_id = -1;
+    int32_t port = 0;
+    uint8_t *ipaddr = NULL;
+    uint8_t *type = NULL;
+
+
+    //AT+TLSCONN=<link ID>,<type>,<remote IP>,<remote port>[,<TCP keep alive>]
+    if(esp_at_get_para_as_digit(cnt++, &socket_id) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+    /* Type */
+    if(esp_at_get_para_as_str(cnt++, &type) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+    /* IP */
+    if(esp_at_get_para_as_str(cnt++, &ipaddr) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+     /* Port */
+    if(esp_at_get_para_as_digit(cnt++, &port) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+     /* Init TLS */
+    sslclient_context *ssl_client = &(ssl_clients[socket_id]);
+    aws_tls_init(ssl_client);
+    int ret = aws_tls_connect(ssl_client, (char *)ipaddr, port, tlsVERISIGN_ROOT_CERTIFICATE_PEM, clientcredentialCLIENT_CERTIFICATE_PEM, clientcredentialCLIENT_PRIVATE_KEY_PEM);
+
+    return ESP_AT_RESULT_CODE_OK;
+}
+
+static uint8_t at_setupTLSSend(uint8_t para_num)
+{
+    uint8_t cnt = 0;
+    int32_t socket_id = -1;
+    int32_t length = 0;
+    int wait_data_timeout = 100;
+
+    //AT+CIPSENDEX=<link ID>,<length>
+    if(esp_at_get_para_as_digit(cnt++, &socket_id) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+    if(ssl_clients[socket_id].init == false)
+        return ESP_AT_RESULT_CODE_ERROR;        
+
+    /* Length */
+    if(esp_at_get_para_as_digit(cnt++, &length) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+    uint8_t *buf = malloc(length);
+    if(!buf)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+
+    /* Return OK to command */
+    at_port_write_data((uint8_t *)OK_RESP, strlen(OK_RESP));
+
+    /* Wait for user to receive */
+    vTaskDelay(10);
+
+    /* Return start read signal */
+    at_port_write_data((uint8_t *)START_READ, strlen(START_READ));
+
+    /* Enable read data from uart */
+    tls_communicate_wait_uart_data = true;
+
+    /* OK! Now wait for uart data */
+    while(wait_data_timeout)
+    {
+        /* Uart data is enought */
+        if(at_port_get_data_length() >= length)
+            break;
+
+        vTaskDelay(10);
+        wait_data_timeout --;
+    }
+    if(wait_data_timeout == 0)
+    {
+        printf("Wait for data timeout \r\n");
+        free(buf);
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    int32_t read = at_port_read_data(buf, length);
+    if(read != length)
+    {
+        printf("Read failed. Expect: %d, Receive: %d \n", length, read);
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    /* Disable waiting read data from uart */
+    tls_communicate_wait_uart_data = false;
+    
+
+    /* It is TLS time */
+    sslclient_context *ssl_client = &(ssl_clients[socket_id]);
+    aws_tls_send(ssl_client, buf, length);
+
+    free(buf);
+
+    return ESP_AT_RESULT_CODE_SEND_OK;
+}
+
+static uint8_t at_closeTLSConnection(uint8_t para_num)
+{
+    uint8_t cnt = 0;
+    int32_t socket_id = -1;
+    int32_t length = 0;
+    int wait_data_timeout = 100;
+
+    if(esp_at_get_para_as_digit(cnt++, &socket_id) != ESP_AT_PARA_PARSE_RESULT_OK)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+    if(socket_id >= 0  && socket_id < MAX_SSL_CLIENT)
+    {
+        if(ssl_clients[socket_id].init)
+        {
+            aws_tls_cleanup((sslclient_context *)&(ssl_clients[socket_id]));
+            return ESP_AT_RESULT_CODE_OK;
+        }
+        else
+        {
+            printf("Socket not init \n");
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+    }
+
+    return ESP_AT_SUB_PARA_INVALID;
+
+}
+
+
 static esp_at_cmd_struct at_custom_cmd[] = {
     {"+UART", NULL, at_queryCmdUart, at_setupCmdUartDef, NULL},
     {"+UART_CUR", NULL, at_queryCmdUart, at_setupCmdUart, NULL},
     {"+UART_DEF", NULL, at_queryCmdUartDef, at_setupCmdUartDef, NULL},
     {"+CIUPDATE", NULL, NULL, at_setupCmdCipupdate, at_exeCmdCipupdate},
+    {"+TLSCLOSE", NULL, NULL, at_closeTLSConnection, NULL },
+    {"+TLSCONN", NULL, NULL, at_setupTLSConnection, NULL },
+    {"+TLSSEND", NULL, NULL, at_setupTLSSend, NULL }
 };
 
 void at_status_callback (esp_at_status_type status)
@@ -506,7 +725,7 @@ void at_task_init(void)
 
     nvs_flash_init();
     at_uart_init();
-
+    esp_log_level_set(LOG_TAG, ESP_LOG_VERBOSE);
     sprintf((char*)version, "compile time:%s %s\r\n", __DATE__, __TIME__);
 #ifdef CONFIG_ESP_AT_FW_VERSION
     if ((strlen(CONFIG_ESP_AT_FW_VERSION) > 0) && (strlen(CONFIG_ESP_AT_FW_VERSION) <= 128)){
@@ -549,10 +768,11 @@ void at_task_init(void)
         printf("regist ble cmd fail\r\n");
     }
 #endif
-
+    xTaskCreate(tls_communicate_task, "tlsComTask", 2048, NULL, 9, NULL);
     esp_at_custom_cmd_array_regist (at_custom_cmd, sizeof(at_custom_cmd)/sizeof(at_custom_cmd[0]));
     esp_at_port_write_data((uint8_t *)"\r\nready\r\n",strlen("\r\nready\r\n"));
-
+    
+    
 }
 
 
